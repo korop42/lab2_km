@@ -1,117 +1,129 @@
-#include <windows.h>
 #include <iostream>
-#include <vector>
-#include <strsafe.h>
+#include <windows.h>
+#include <fstream>
+#include <string>
 
-using namespace std;
-
-HANDLE hSemaphore;
-HANDLE hEvent;
-CRITICAL_SECTION cs;
-HANDLE hFileMapping;
-LPVOID lpMapAddress;
-const int MAP_SIZE = 10000;
-int offset = 0;
-
-void WriteToFile(const string& msg) {
-    memcpy((char*)lpMapAddress + offset, msg.c_str(), msg.size());
-    offset += msg.size();
-}
+const int NUM_THREADS = 6;
+const int NUMBERS_TO_WRITE = 500;
+const int MAX_CONCURRENT_THREADS = 2;
+const int FILE_SIZE = 4096;
 
 struct ThreadData {
-    int start, end, step;
-    int pairID;
-    HANDLE hHeap;
+    HANDLE hFileMapping;
+    int threadId;
+    int pairId;
 };
+
+CRITICAL_SECTION consoleCriticalSection; // Додано критичну секцію
 
 DWORD WINAPI ThreadFunction(LPVOID lpParam) {
     ThreadData* data = (ThreadData*)lpParam;
-
-    char* buffer = (char*)HeapAlloc(data->hHeap, 0, 100);
-
+    HANDLE hSemaphore = OpenSemaphore(SEMAPHORE_ALL_ACCESS, FALSE, L"MySemaphore");
+    if (hSemaphore == NULL) {
+        std::cerr << "Error opening semaphore: " << GetLastError() << std::endl;
+        return 1;
+    }
     WaitForSingleObject(hSemaphore, INFINITE);
 
-    if (data->pairID == 1) {
-        for (int i = data->start; i != data->end; i += data->step) {
-            StringCchPrintfA(buffer, 100, "Thread %d: %d\n", data->pairID, i);
-            cout << buffer;
-            WriteToFile(buffer);
+    char* pData = (char*)MapViewOfFile(data->hFileMapping, FILE_MAP_ALL_ACCESS, 0, 0, FILE_SIZE);
+    if (pData == NULL) {
+        std::cerr << "Error mapping file: " << GetLastError() << std::endl;
+        ReleaseSemaphore(hSemaphore, 1, NULL);
+        return 1;
+    }
+
+    std::ofstream outFile("output.txt", std::ios::app);
+
+    std::string syncMethod;
+    if (data->pairId == 0) {
+        syncMethod = "No Sync";
+    }
+    else if (data->pairId == 1) {
+        syncMethod = "Event Sync";
+    }
+    else {
+        syncMethod = "Critical Section Sync";
+    }
+
+    if (data->threadId % 2 == 1) { // Positive numbers
+        for (int i = 1; i <= NUMBERS_TO_WRITE; ++i) {
+            std::string s = std::to_string(i) + " ";
+            outFile << s;
+            memcpy(pData, s.c_str(), s.size());
+            pData += s.size();
+
+            EnterCriticalSection(&consoleCriticalSection); // Вхід в критичну секцію
+            std::cout << "Pair " << data->pairId + 1 << " (" << syncMethod << "), Thread " << data->threadId << ": " << i << std::endl;
+            LeaveCriticalSection(&consoleCriticalSection); // Вихід з критичної секції
         }
     }
-    else if (data->pairID == 2) {
-        for (int i = data->start; i != data->end; i += data->step) {
-            WaitForSingleObject(hEvent, INFINITE);
-            StringCchPrintfA(buffer, 100, "Thread %d: %d\n", data->pairID, i);
-            cout << buffer;
-            WriteToFile(buffer);
-            SetEvent(hEvent);
-        }
-    }
-    else if (data->pairID == 3) {
-        for (int i = data->start; i != data->end; i += data->step) {
-            EnterCriticalSection(&cs);
-            StringCchPrintfA(buffer, 100, "Thread %d: %d\n", data->pairID, i);
-            cout << buffer;
-            WriteToFile(buffer);
-            LeaveCriticalSection(&cs);
+    else { // Negative numbers
+        for (int i = -1; i >= -NUMBERS_TO_WRITE; --i) {
+            std::string s = std::to_string(i) + " ";
+            outFile << s;
+            memcpy(pData, s.c_str(), s.size());
+            pData += s.size();
+
+            EnterCriticalSection(&consoleCriticalSection); // Вхід в критичну секцію
+            std::cout << "Pair " << data->pairId + 1 << " (" << syncMethod << "), Thread " << data->threadId << ": " << i << std::endl;
+            LeaveCriticalSection(&consoleCriticalSection); // Вихід з критичної секції
         }
     }
 
+    outFile.close();
+    UnmapViewOfFile(pData);
     ReleaseSemaphore(hSemaphore, 1, NULL);
-    HeapFree(data->hHeap, 0, buffer);
+    CloseHandle(hSemaphore);
     return 0;
 }
 
 int main() {
-    InitializeCriticalSection(&cs);
-    hSemaphore = CreateSemaphore(NULL, 2, 2, NULL);
-    hEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
+    HANDLE hFile = CreateFile(L"shared.txt", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFileMapping = CreateFileMapping(hFile, NULL, PAGE_READWRITE, 0, FILE_SIZE, NULL);
+    HANDLE hThreads[NUM_THREADS];
+    ThreadData threadData[NUM_THREADS];
+    HANDLE hSemaphore = CreateSemaphore(NULL, MAX_CONCURRENT_THREADS, MAX_CONCURRENT_THREADS, L"MySemaphore");
+    HANDLE hEvents[3];
+    CRITICAL_SECTION criticalSections[3];
 
-    HANDLE hFile = CreateFile(L"output.txt", GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    hFileMapping = CreateFileMapping(hFile, NULL, PAGE_READWRITE, 0, MAP_SIZE, NULL);
-    lpMapAddress = MapViewOfFile(hFileMapping, FILE_MAP_ALL_ACCESS, 0, 0, MAP_SIZE);
+    hEvents[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
+    hEvents[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
+    hEvents[2] = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    vector<HANDLE> threads;
-    vector<ThreadData*> threadData;
+    InitializeCriticalSection(&criticalSections[0]);
+    InitializeCriticalSection(&criticalSections[1]);
+    InitializeCriticalSection(&criticalSections[2]);
+    InitializeCriticalSection(&consoleCriticalSection); // Ініціалізація критичної секції для консолі
 
-    for (int pair = 1; pair <= 3; pair++) {
-        HANDLE hHeap = HeapCreate(0, 0, 0);
-
-        ThreadData* data1 = (ThreadData*)HeapAlloc(hHeap, HEAP_ZERO_MEMORY, sizeof(ThreadData));
-        data1->start = 1; data1->end = 501; data1->step = 1; data1->pairID = pair; data1->hHeap = hHeap;
-        HANDLE t1 = CreateThread(NULL, 0, ThreadFunction, data1, CREATE_SUSPENDED, NULL);
-
-        ThreadData* data2 = (ThreadData*)HeapAlloc(hHeap, HEAP_ZERO_MEMORY, sizeof(ThreadData));
-        data2->start = -1; data2->end = -501; data2->step = -1; data2->pairID = pair; data2->hHeap = hHeap;
-        HANDLE t2 = CreateThread(NULL, 0, ThreadFunction, data2, CREATE_SUSPENDED, NULL);
-
-        threads.push_back(t1);
-        threads.push_back(t2);
-        threadData.push_back(data1);
-        threadData.push_back(data2);
-
-        SetThreadPriority(t1, THREAD_PRIORITY_ABOVE_NORMAL);
-        SetThreadPriority(t2, THREAD_PRIORITY_BELOW_NORMAL);
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        threadData[i].hFileMapping = hFileMapping;
+        threadData[i].threadId = i + 1;
+        threadData[i].pairId = i / 2; // Assign pair ID
+        hThreads[i] = CreateThread(NULL, 0, ThreadFunction, &threadData[i], CREATE_SUSPENDED, NULL);
+        if (hThreads[i] == NULL) {
+            std::cerr << "Error creating thread: " << GetLastError() << std::endl;
+            return 1;
+        }
     }
 
-    for (auto& t : threads) {
-        ResumeThread(t);
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        ResumeThread(hThreads[i]);
     }
 
-    WaitForMultipleObjects(threads.size(), threads.data(), TRUE, INFINITE);
+    WaitForMultipleObjects(NUM_THREADS, hThreads, TRUE, INFINITE);
 
-    for (size_t i = 0; i < threads.size(); ++i) {
-        CloseHandle(threads[i]);
-        HeapDestroy(threadData[i]->hHeap);
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        CloseHandle(hThreads[i]);
     }
 
-    UnmapViewOfFile(lpMapAddress);
     CloseHandle(hFileMapping);
     CloseHandle(hFile);
     CloseHandle(hSemaphore);
-    CloseHandle(hEvent);
-    DeleteCriticalSection(&cs);
 
-    cout << "All threads completed.\n";
+    DeleteCriticalSection(&criticalSections[0]);
+    DeleteCriticalSection(&criticalSections[1]);
+    DeleteCriticalSection(&criticalSections[2]);
+    DeleteCriticalSection(&consoleCriticalSection); // Видалення критичної секції для консолі
+
     return 0;
 }
